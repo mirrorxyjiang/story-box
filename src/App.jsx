@@ -1855,8 +1855,59 @@ const TOOLS = [
   { key: "ellipse", label: "圆形", glyph: "◯" },
   { key: "line", label: "直线", glyph: "／" },
   { key: "arrow", label: "箭头", glyph: "→" },
+  { key: "wave", label: "波浪线", glyph: "∿" },
+  { key: "braceL", label: "左大括号", glyph: "｛" },
+  { key: "braceR", label: "右大括号", glyph: "｝" },
   { key: "text", label: "文本", glyph: "T" },
 ];
+
+// 画布元素的统一包围盒：矩形/圆形/图片/波浪线/大括号用 x,y,w,h；
+// 图标是以 (x,y) 为中心的圆，尺寸存在 size 上，这里也换算成同样的包围盒，缩放逻辑就能共用一套。
+function elementBox(el) {
+  if (el.type === "rect" || el.type === "ellipse" || el.type === "image" || el.type === "wave" || el.type === "brace") {
+    return { x: el.x, y: el.y, w: el.w, h: el.h };
+  }
+  if (el.type === "icon") {
+    const s = el.size || DEFAULT_ICON_SIZE;
+    return { x: el.x - s / 2, y: el.y - s / 2, w: s, h: s };
+  }
+  return null;
+}
+const DEFAULT_ICON_SIZE = 32;
+
+// 波浪线路径：沿长边方向按正弦采样出一条平滑曲线，短边决定振幅
+function wavePath(x, y, w, h) {
+  const W = Math.max(w, 2), H = Math.max(h, 2);
+  const horizontal = W >= H;
+  const length = horizontal ? W : H;
+  const amp = Math.max(2, (horizontal ? H : W) / 2);
+  const cycles = Math.max(1, Math.min(20, Math.round(length / 42)));
+  const steps = cycles * 12;
+  const pts = [];
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const offset = Math.sin(t * cycles * Math.PI * 2) * amp;
+    pts.push(horizontal
+      ? [x + t * W, y + H / 2 - offset]
+      : [x + W / 2 - offset, y + t * H]);
+  }
+  return "M" + pts.map((p) => `${p[0].toFixed(1)},${p[1].toFixed(1)}`).join(" L");
+}
+
+// 大括号不再手绘路径（拉伸后容易变形走样），直接渲染衬线字体的真实字形 { }，
+// 字号随元素高度缩放，形状永远和标准字形一致。这里只保留一个宽度估算用于防止窄框溢出。
+const BRACE_CHAR = { left: "{", right: "}" };
+function braceFontSize(el) {
+  return Math.min(el.h * 0.96, el.w / 0.3);
+}
+
+function shapePathOf(el) {
+  if (el.type === "wave") return wavePath(el.x, el.y, el.w, el.h);
+  return "";
+}
+
+const WAVE_TYPES = new Set(["wave"]);
+const STROKE_ONLY_TYPES = new Set(["wave", "brace"]); // 只有描边/字形颜色，没有填充
 
 function DrawPage({ page, onChange, bookId, onError }) {
   const [name, setName] = useState(page.name);
@@ -1955,6 +2006,7 @@ function DrawPage({ page, onChange, bookId, onError }) {
 
   const handleCanvasDown = (e) => {
     if (tool === "select" || isPanMode) return;
+    if (tool === "icon") return; // 图标由 placeIcon 单击放置，不走"拖框创建"，否则会多出一个 (0,0) 的残缺元素
     const { x, y } = svgPoint(e);
     if (tool === "text") {
       const el = { id: uid(), type: "text", x, y, text: "文本", note: "", color: "#33302a", bold: false, fontSize: 13 };
@@ -1962,7 +2014,15 @@ function DrawPage({ page, onChange, bookId, onError }) {
       setTool("select"); setSelectedId(el.id);
       return;
     }
-    setDraft({ type: tool, x1: x, y1: y, x2: x, y2: y, ...defaultShapeStyle() });
+    // 波浪线 / 大括号也走"拖框创建"，内部统一存成 brace + braceSide
+    const draftType = tool === "braceL" || tool === "braceR" ? "brace" : tool;
+    const style = defaultShapeStyle();
+    setDraft({
+      type: draftType, x1: x, y1: y, x2: x, y2: y,
+      braceSide: tool === "braceR" ? "right" : "left",
+      stroke: style.stroke, strokeWidth: style.strokeWidth, strokeStyle: style.strokeStyle,
+      fill: "none", fillOpacity: 1,
+    });
   };
 
   const handleCanvasMove = (e) => {
@@ -1973,6 +2033,15 @@ function DrawPage({ page, onChange, bookId, onError }) {
       const { x, y } = svgPoint(e);
       setElements((els) => els.map((el) => {
         if (el.id !== drag.id) return el;
+        // 缩放：从右下角手柄拖动，图标按正方形等比缩放，其余按包围盒宽高各自缩放
+        if (drag.mode === "resize") {
+          const dw = x - drag.startX, dh = y - drag.startY;
+          if (el.type === "icon") {
+            const size = Math.max(12, Math.min(400, Math.round(drag.startW + (dw + dh) / 2)));
+            return { ...el, size };
+          }
+          return { ...el, w: Math.max(16, Math.round(drag.startW + dw)), h: Math.max(16, Math.round(drag.startH + dh)) };
+        }
         if (el.type === "line" || el.type === "arrow") {
           if (drag.endpoint === "1") return { ...el, x1: x, y1: y };
           if (drag.endpoint === "2") return { ...el, x2: x, y2: y };
@@ -1998,11 +2067,17 @@ function DrawPage({ page, onChange, bookId, onError }) {
   const handleCanvasUp = () => {
     if (draft) {
       const w = Math.abs(draft.x2 - draft.x1), h = Math.abs(draft.y2 - draft.y1);
-      if (draft.type === "rect" || draft.type === "ellipse") {
+      const boxX = Math.min(draft.x1, draft.x2), boxY = Math.min(draft.y1, draft.y2);
+      if (draft.type === "rect" || draft.type === "ellipse" || STROKE_ONLY_TYPES.has(draft.type)) {
         if (w > 4 || h > 4) {
-          const el = { id: uid(), type: draft.type, x: Math.min(draft.x1, draft.x2), y: Math.min(draft.y1, draft.y2),
-            w: Math.max(w, 20), h: Math.max(h, 20), stroke: draft.stroke, strokeWidth: draft.strokeWidth,
-            strokeStyle: draft.strokeStyle, fill: draft.fill, fillOpacity: draft.fillOpacity, note: "" };
+          const el = {
+            id: uid(), type: draft.type, x: boxX, y: boxY,
+            w: Math.max(w, 20), h: Math.max(h, 20),
+            stroke: draft.stroke, strokeWidth: draft.strokeWidth,
+            strokeStyle: draft.strokeStyle, fill: draft.fill, fillOpacity: draft.fillOpacity, note: "",
+          };
+          if (STROKE_ONLY_TYPES.has(draft.type)) el.fill = "none";
+          if (draft.type === "brace") el.braceSide = draft.braceSide;
           setElements((els) => [...els, el]); setSelectedId(el.id);
         }
       } else {
@@ -2027,6 +2102,16 @@ function DrawPage({ page, onChange, bookId, onError }) {
     }
   };
 
+  // 从右下角手柄开始缩放（图标 / 图片 / 形状都支持）
+  const startResizeElement = (e, el) => {
+    if (tool !== "select") return;
+    e.stopPropagation(); setSelectedId(el.id); setBgSelected(false);
+    const box = elementBox(el);
+    if (!box) return;
+    const { x, y } = svgPoint(e);
+    dragRef.current = { id: el.id, mode: "resize", startX: x, startY: y, startW: box.w, startH: box.h };
+  };
+
   const startBgDrag = (e) => {
     const { x, y } = svgPoint(e);
     bgDragRef.current = { mode: "move", offsetX: x - background.x, offsetY: y - background.y };
@@ -2039,7 +2124,7 @@ function DrawPage({ page, onChange, bookId, onError }) {
   const placeIcon = (e) => {
     if (tool !== "icon") return;
     const { x, y } = svgPoint(e);
-    const el = { id: uid(), type: "icon", x, y, iconKey: pickedIcon, note: "" };
+    const el = { id: uid(), type: "icon", x, y, size: DEFAULT_ICON_SIZE, iconKey: pickedIcon, note: "", bgColor: "#f4efe3", bgOpacity: 1 };
     setElements((els) => [...els, el]); setSelectedId(el.id);
   };
 
@@ -2189,13 +2274,25 @@ function DrawPage({ page, onChange, bookId, onError }) {
               />
             )}
 
-            {elements.map((el) => renderElement(el, selectedId === el.id, startDragElement, dashArray))}
+            {elements.map((el) => renderElement(el, selectedId === el.id, startDragElement, dashArray, startResizeElement))}
             {draft && (draft.type === "rect" ? (
               <rect x={Math.min(draft.x1, draft.x2)} y={Math.min(draft.y1, draft.y2)} width={Math.abs(draft.x2 - draft.x1)} height={Math.abs(draft.y2 - draft.y1)}
                 fill={draft.fill} fillOpacity={draft.fillOpacity} stroke={draft.stroke} strokeWidth={draft.strokeWidth} />
             ) : draft.type === "ellipse" ? (
               <ellipse cx={(draft.x1 + draft.x2) / 2} cy={(draft.y1 + draft.y2) / 2} rx={Math.abs(draft.x2 - draft.x1) / 2} ry={Math.abs(draft.y2 - draft.y1) / 2}
                 fill={draft.fill} fillOpacity={draft.fillOpacity} stroke={draft.stroke} strokeWidth={draft.strokeWidth} />
+            ) : draft.type === "brace" ? (
+              // 大括号预览：与正式元素相同，直接渲染真实字形
+              <text
+                x={Math.min(draft.x1, draft.x2) + Math.abs(draft.x2 - draft.x1) / 2}
+                y={Math.min(draft.y1, draft.y2) + Math.abs(draft.y2 - draft.y1) * 0.74}
+                fontSize={Math.abs(draft.y2 - draft.y1) * 0.96}
+                fontFamily="'Times New Roman', 'Noto Serif SC', serif" textAnchor="middle" fill={draft.stroke}
+                style={{ userSelect: "none" }}>{draft.braceSide === "right" ? "}" : "{"}</text>
+            ) : draft.type === "wave" ? (
+              <path
+                d={wavePath(Math.min(draft.x1, draft.x2), Math.min(draft.y1, draft.y2), Math.abs(draft.x2 - draft.x1), Math.abs(draft.y2 - draft.y1))}
+                fill="none" stroke={draft.stroke} strokeWidth={draft.strokeWidth} strokeLinecap="round" />
             ) : (
               <line x1={draft.x1} y1={draft.y1} x2={draft.x2} y2={draft.y2} stroke={draft.stroke} strokeWidth={draft.strokeWidth}
                 markerEnd={draft.type === "arrow" ? "url(#arrowhead)" : undefined} />
@@ -2275,14 +2372,48 @@ function BackgroundInspector({ background, onPatch, onRemove }) {
   );
 }
 
-function renderElement(el, isSelected, startDrag, dashArray) {
+function renderElement(el, isSelected, startDrag, dashArray, startResize) {
+  // 选中且有包围盒的元素，统一在右下角给出一个缩放手柄
+  const box = elementBox(el);
+  const handle = (isSelected && box && (
+    <circle cx={box.x + box.w} cy={box.y + box.h} r={6} fill="#8a5a2b" stroke="#fff" strokeWidth="1.5"
+      style={{ cursor: "nwse-resize" }} onMouseDown={(e) => { e.stopPropagation(); startResize(e, el); }} />
+  ));
+  const outline = (isSelected && box && (
+    <rect x={box.x - 2} y={box.y - 2} width={box.w + 4} height={box.h + 4} fill="none"
+      stroke="#8a5a2b" strokeDasharray="3,3" pointerEvents="none" />
+  ));
+
+  if (el.type === "brace") {
+    return (
+      <g key={el.id} onMouseDown={(e) => startDrag(e, el)} style={{ cursor: "move" }}>
+        <text x={el.x + el.w / 2} y={el.y + el.h * 0.74} fontSize={braceFontSize(el)}
+          fontFamily="'Times New Roman', 'Noto Serif SC', serif" textAnchor="middle" fill={el.stroke}
+          style={{ userSelect: "none" }}>{BRACE_CHAR[el.braceSide === "right" ? "right" : "left"]}</text>
+        {outline}
+        {handle}
+      </g>
+    );
+  }
+  if (WAVE_TYPES.has(el.type)) {
+    return (
+      <g key={el.id}>
+        <path d={shapePathOf(el)} fill="none" stroke={el.stroke} strokeWidth={el.strokeWidth}
+          strokeDasharray={dashArray(el.strokeStyle)} strokeLinecap="round"
+          onMouseDown={(e) => startDrag(e, el)} style={{ cursor: "move" }} />
+        {outline}
+        {handle}
+      </g>
+    );
+  }
   if (el.type === "rect") {
     return (
       <g key={el.id}>
         <rect x={el.x} y={el.y} width={el.w} height={el.h} fill={el.fill} fillOpacity={el.fillOpacity}
           stroke={el.stroke} strokeWidth={el.strokeWidth} strokeDasharray={dashArray(el.strokeStyle)}
           onMouseDown={(e) => startDrag(e, el)} style={{ cursor: "move" }} />
-        {isSelected && <rect x={el.x - 2} y={el.y - 2} width={el.w + 4} height={el.h + 4} fill="none" stroke="#8a5a2b" strokeDasharray="3,3" pointerEvents="none" />}
+        {outline}
+        {handle}
       </g>
     );
   }
@@ -2292,7 +2423,8 @@ function renderElement(el, isSelected, startDrag, dashArray) {
         <ellipse cx={el.x + el.w / 2} cy={el.y + el.h / 2} rx={el.w / 2} ry={el.h / 2} fill={el.fill} fillOpacity={el.fillOpacity}
           stroke={el.stroke} strokeWidth={el.strokeWidth} strokeDasharray={dashArray(el.strokeStyle)}
           onMouseDown={(e) => startDrag(e, el)} style={{ cursor: "move" }} />
-        {isSelected && <rect x={el.x - 2} y={el.y - 2} width={el.w + 4} height={el.h + 4} fill="none" stroke="#8a5a2b" strokeDasharray="3,3" pointerEvents="none" />}
+        {outline}
+        {handle}
       </g>
     );
   }
@@ -2314,16 +2446,31 @@ function renderElement(el, isSelected, startDrag, dashArray) {
   }
   if (el.type === "icon") {
     const ic = ICON_LIBRARY.find((i) => i.key === el.iconKey) || ICON_LIBRARY[0];
+    const size = el.size || DEFAULT_ICON_SIZE;
+    const r = size / 2;
+    const bgOpacity = el.bgOpacity === undefined ? 1 : el.bgOpacity; // 0 = 完全不画背景圆
     return (
       <g key={el.id} onMouseDown={(e) => startDrag(e, el)} style={{ cursor: "move" }}>
-        <circle cx={el.x} cy={el.y} r={16} fill="#f4efe3" stroke={isSelected ? "#8a5a2b" : "#c9bda1"} strokeWidth={isSelected ? 2 : 1.5} />
-        <text x={el.x} y={el.y + 5} fontSize="15" textAnchor="middle" fill="#33302a">{ic.glyph}</text>
-        {el.note && <circle cx={el.x + 11} cy={el.y - 11} r={3.5} fill="#8a5a2b" />}
+        {bgOpacity > 0 && (
+          <circle cx={el.x} cy={el.y} r={r} fill={el.bgColor || "#f4efe3"} fillOpacity={bgOpacity}
+            stroke={isSelected ? "#8a5a2b" : "#c9bda1"} strokeWidth={isSelected ? 2 : 1.5} />
+        )}
+        <text x={el.x} y={el.y + size * 0.19} fontSize={Math.max(8, size * 0.55)} textAnchor="middle" fill="#33302a">{ic.glyph}</text>
+        {el.note && <circle cx={el.x + r * 0.7} cy={el.y - r * 0.7} r={Math.max(2.5, size * 0.11)} fill="#8a5a2b" />}
+        {bgOpacity === 0 && isSelected && (
+          <circle cx={el.x} cy={el.y} r={r} fill="none" stroke="#8a5a2b" strokeDasharray="3,3" pointerEvents="none" />
+        )}
+        {handle}
       </g>
     );
   }
   if (el.type === "image") {
-    return <ImageElement key={el.id} el={el} isSelected={isSelected} startDrag={startDrag} />;
+    return (
+      <g key={el.id}>
+        <ImageElement el={el} isSelected={isSelected} startDrag={startDrag} startResize={startResize} />
+        {handle}
+      </g>
+    );
   }
   if (el.type === "text") {
     // 这里特意不用 contentEditable：一个由 React 渲染内容、又允许浏览器直接编辑 DOM 的元素，
@@ -2352,15 +2499,16 @@ function renderElement(el, isSelected, startDrag, dashArray) {
 function ImageElement({ el, isSelected, startDrag }) {
   const loaded = useAssetDataUrl(el.assetPath);
   const url = el.assetPath ? loaded : el.src;
+  const w = el.w || 64, h = el.h || 64;
   return (
     <g onMouseDown={(e) => startDrag(e, el)} style={{ cursor: "move" }}>
       {url ? (
-        <image href={url} x={el.x} y={el.y} width={el.w} height={el.h} />
+        <image href={url} x={el.x} y={el.y} width={w} height={h} />
       ) : (
-        <rect x={el.x} y={el.y} width={el.w} height={el.h} fill="#e5ddc8" stroke="#c9bda1" strokeDasharray="3,3" />
+        <rect x={el.x} y={el.y} width={w} height={h} fill="#e5ddc8" stroke="#c9bda1" strokeDasharray="3,3" />
       )}
-      <rect x={el.x} y={el.y} width={el.w} height={el.h} fill="none" stroke={isSelected ? "#8a5a2b" : "transparent"} strokeWidth="2" />
-      {el.note && <circle cx={el.x + el.w - 6} cy={el.y + 6} r={3.5} fill="#8a5a2b" />}
+      <rect x={el.x} y={el.y} width={w} height={h} fill="none" stroke={isSelected ? "#8a5a2b" : "transparent"} strokeWidth="2" />
+      {el.note && <circle cx={el.x + w - 6} cy={el.y + 6} r={3.5} fill="#8a5a2b" />}
     </g>
   );
 }
@@ -2368,6 +2516,8 @@ function ImageElement({ el, isSelected, startDrag }) {
 function ElementInspector({ el, onPatch, onDelete }) {
   const hasBorderFill = el.type === "rect" || el.type === "ellipse";
   const isLineLike = el.type === "line" || el.type === "arrow";
+  const isStrokePath = STROKE_ONLY_TYPES.has(el.type); // 波浪线 / 大括号：只有描边，没有填充
+  const box = elementBox(el);
   return (
     <div>
       <h4>元素设置</h4>
@@ -2375,6 +2525,31 @@ function ElementInspector({ el, onPatch, onDelete }) {
         <div className="field">
           <label>连线文字标签</label>
           <input type="text" value={el.label || ""} onChange={(e) => onPatch({ label: e.target.value })} placeholder="如：暗中效忠" />
+        </div>
+      )}
+      {el.type === "brace" && (
+        <div className="field">
+          <label>大括号朝向</label>
+          <div className="seg">
+            <button className={el.braceSide !== "right" ? "on" : ""} onClick={() => onPatch({ braceSide: "left" })}>｛ 左</button>
+            <button className={el.braceSide === "right" ? "on" : ""} onClick={() => onPatch({ braceSide: "right" })}>右 ｝</button>
+          </div>
+        </div>
+      )}
+      {box && (
+        <div className="field">
+          <label>尺寸：{Math.round(box.w)} × {Math.round(box.h)}</label>
+          {el.type === "icon" ? (
+            <input type="range" min="12" max="160" step="1" value={Math.round(box.w)} onChange={(e) => onPatch({ size: Number(e.target.value) })} />
+          ) : (
+            <input
+              type="range" min="16" max="400" step="1" value={Math.round(box.w)}
+              onChange={(e) => onPatch({ w: Number(e.target.value), h: Math.round(box.h * (Number(e.target.value) / Math.max(box.w, 1))) })}
+            />
+          )}
+          <div style={{ color: "var(--ink-soft)", fontSize: 11, marginTop: 4 }}>
+            也可以直接拖动画布上右下角的圆点缩放（文本元素用下面的字号调整）
+          </div>
         </div>
       )}
       {el.type === "text" && (
@@ -2402,18 +2577,18 @@ function ElementInspector({ el, onPatch, onDelete }) {
           </div>
         </>
       )}
-      {(hasBorderFill || isLineLike) && (
+      {(hasBorderFill || isLineLike || isStrokePath) && (
         <>
           <div className="field">
-            <label>边框颜色</label>
+            <label>{isLineLike || isStrokePath ? "线条颜色" : "边框颜色"}</label>
             <input type="color" value={el.stroke} onChange={(e) => onPatch({ stroke: e.target.value })} />
           </div>
           <div className="field">
-            <label>边框粗细：{el.strokeWidth}px</label>
+            <label>{isLineLike || isStrokePath ? "线条粗细" : "边框粗细"}：{el.strokeWidth}px</label>
             <input type="range" min="1" max="10" value={el.strokeWidth} onChange={(e) => onPatch({ strokeWidth: Number(e.target.value) })} />
           </div>
           <div className="field">
-            <label>边框样式</label>
+            <label>{isLineLike || isStrokePath ? "线条样式" : "边框样式"}</label>
             <div className="seg">
               {["solid", "dashed", "dotted"].map((s) => (
                 <button key={s} className={el.strokeStyle === s ? "on" : ""} onClick={() => onPatch({ strokeStyle: s })}>
@@ -2436,7 +2611,19 @@ function ElementInspector({ el, onPatch, onDelete }) {
           </div>
         </>
       )}
-      {(el.type === "icon" || el.type === "image" || hasBorderFill) && (
+      {el.type === "icon" && (
+        <>
+          <div className="field">
+            <label>圆形底色</label>
+            <input type="color" value={el.bgColor || "#f4efe3"} onChange={(e) => onPatch({ bgColor: e.target.value })} />
+          </div>
+          <div className="field">
+            <label>底色不透明度：{Math.round((el.bgOpacity === undefined ? 1 : el.bgOpacity) * 100)}%（0% = 不显示底色）</label>
+            <input type="range" min="0" max="1" step="0.05" value={el.bgOpacity === undefined ? 1 : el.bgOpacity} onChange={(e) => onPatch({ bgOpacity: Number(e.target.value) })} />
+          </div>
+        </>
+      )}
+      {(el.type === "icon" || el.type === "image" || hasBorderFill || isStrokePath) && (
         <div className="field">
           <label>备注</label>
           <textarea value={el.note || ""} onChange={(e) => onPatch({ note: e.target.value })} placeholder="点击元素后可在此记录详细内容…" />
