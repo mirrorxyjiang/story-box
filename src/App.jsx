@@ -947,7 +947,14 @@ function Shell({ children }) {
         .text-toolbar { display: flex; gap: 4px; padding: 8px 20px; border-bottom: 1px solid var(--line); background: var(--paper); }
         .text-toolbar button { width: 28px; height: 28px; border: 1px solid var(--line); background: var(--panel); border-radius: 4px; cursor: pointer; font-size: 13px; color: var(--ink); }
         .text-toolbar button:hover { border-color: var(--accent); }
-        .text-editor { flex: 1; padding: 28px 40px; overflow-y: auto; outline: none; font-size: 14.5px; line-height: 1.9; max-width: 780px; }
+        .text-toolbar-sep { width: 1px; background: var(--line); margin: 2px 6px; }
+        .text-toolbar button.font-size-btn { font-weight: 700; }
+        .text-toolbar button.font-size-btn sup { font-size: 9px; margin-left: 1px; }
+        .text-toolbar button.font-size-btn:disabled { opacity: 0.35; cursor: default; }
+        .text-toolbar button.font-size-label { width: auto; min-width: 44px; padding: 0 6px; font-size: 11.5px; color: var(--ink-soft); }
+        .text-editor { flex: 1; padding: 28px 40px; overflow-y: auto; outline: none; font-size: 14.5px; line-height: calc(1em + 12px); max-width: 780px; }
+        .text-editor h3 { line-height: calc(1em + 12px); }
+        .text-editor p { margin: 0; }
         .text-editor:empty:before { content: attr(data-placeholder); color: #a89f8c; }
         .draw-page { display: flex; flex-direction: column; height: 100%; }
         .draw-toolbar { display: flex; align-items: center; gap: 6px; padding: 8px 16px; border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
@@ -1288,6 +1295,31 @@ function EmptyState({ moduleName }) {
 
 /* ============================================================ 文字区 */
 
+// 清掉富文本里自带的字号/行高/字体/上下边距（多半是从网页、Word 粘贴带进来的行内样式）。
+// 否则这些行内字号会压过 A-/A+ 设置的字号，出现"点了 A+ 空行变大、文字却不变"的情况。
+const STRIP_STYLE_PROPS = ["font-size", "font-family", "font", "line-height", "margin-top", "margin-bottom"];
+function stripInlineTextSizing(html) {
+  if (!html) return html || "";
+  try {
+    const box = document.createElement("div");
+    box.innerHTML = html;
+    box.querySelectorAll("[style]").forEach((el) => {
+      STRIP_STYLE_PROPS.forEach((prop) => el.style.removeProperty(prop));
+      if (!(el.getAttribute("style") || "").trim()) el.removeAttribute("style");
+    });
+    box.querySelectorAll("font").forEach((f) => { f.removeAttribute("size"); f.removeAttribute("face"); });
+    return box.innerHTML;
+  } catch (err) {
+    console.error("清理行内字号失败：", err);
+    return html;
+  }
+}
+
+// 文字页字号（px）：A-/A+ 每次调整 1px，按页面单独保存在 page.content.fontSize 里
+const TEXT_DEFAULT_FONT_SIZE = 15;
+const TEXT_MIN_FONT_SIZE = 10;
+const TEXT_MAX_FONT_SIZE = 40;
+
 function TextPage({ page, onChange, variables }) {
   const ref = useRef(null);
   const [name, setName] = useState(page.name);
@@ -1301,7 +1333,8 @@ function TextPage({ page, onChange, variables }) {
     // 出错也只是这次没同步成功，不会导致渲染中断。
     try {
       const node = ref.current;
-      if (node && node.innerHTML !== (page.content.html || "")) node.innerHTML = page.content.html || "";
+      const cleaned = stripInlineTextSizing(page.content.html || "");
+      if (node && node.innerHTML !== cleaned) node.innerHTML = cleaned;
     } catch (err) {
       console.error("同步文字内容到编辑器失败：", err);
     }
@@ -1347,13 +1380,29 @@ function TextPage({ page, onChange, variables }) {
   const handleInput = () => {
     if (typingTimer.current) clearTimeout(typingTimer.current);
     typingTimer.current = setTimeout(() => {
-      onChange((p) => ({ ...p, content: { html: readHtml() } }));
+      onChange((p) => ({ ...p, content: { ...p.content, html: readHtml() } }));
     }, 1000);
+  };
+
+  // 粘贴一律按纯文本处理，不带入外部的字号/行距/字体；按换行拆成段落
+  const handlePaste = (e) => {
+    try {
+      const text = (e.clipboardData || window.clipboardData)?.getData("text/plain");
+      if (text == null) return;
+      e.preventDefault();
+      text.replace(/\r\n?/g, "\n").split("\n").forEach((line, i) => {
+        if (i > 0) document.execCommand("insertParagraph");
+        if (line) document.execCommand("insertText", false, line);
+      });
+      handleInput();
+    } catch (err) {
+      console.error("粘贴失败：", err);
+    }
   };
 
   const handleManualSave = () => {
     if (typingTimer.current) clearTimeout(typingTimer.current);
-    onChange((p) => ({ ...p, content: { html: readHtml() } }), { immediate: true });
+    onChange((p) => ({ ...p, content: { ...p.content, html: readHtml() } }), { immediate: true });
   };
 
   // 点击右侧角色面板里的名字，把它插入到正文当前光标处，方便写作时不用手打人名
@@ -1380,6 +1429,16 @@ function TextPage({ page, onChange, variables }) {
     } catch (err) {
       console.error("插入角色名失败：", err);
     }
+  };
+
+  const fontSize = page.content.fontSize || TEXT_DEFAULT_FONT_SIZE;
+  const changeFontSize = (delta) => {
+    const next = Math.min(TEXT_MAX_FONT_SIZE, Math.max(TEXT_MIN_FONT_SIZE, fontSize + delta));
+    if (next === fontSize) return;
+    onChange((p) => ({ ...p, content: { ...p.content, fontSize: next } }));
+  };
+  const resetFontSize = () => {
+    onChange((p) => ({ ...p, content: { ...p.content, fontSize: TEXT_DEFAULT_FONT_SIZE } }));
   };
 
   // 变量板：正文模块才有（variables 为 null 时隐藏），按类别展示各 12 个变量，点击插入到光标处
@@ -1418,14 +1477,19 @@ function TextPage({ page, onChange, variables }) {
           <button onClick={() => exec("insertUnorderedList")}>•≡</button>
           <button onClick={() => exec("insertOrderedList")}>1≡</button>
           <button onMouseDown={(e) => { e.preventDefault(); exec("formatBlock", "H3"); }}>H</button>
+          <span className="text-toolbar-sep" />
+          <button className="font-size-btn" title="缩小字体" disabled={fontSize <= TEXT_MIN_FONT_SIZE} onClick={() => changeFontSize(-1)}>A<sup>−</sup></button>
+          <button className="font-size-label" title="点击恢复默认字号" onClick={resetFontSize}>{fontSize}px</button>
+          <button className="font-size-btn" title="放大字体" disabled={fontSize >= TEXT_MAX_FONT_SIZE} onClick={() => changeFontSize(1)}>A<sup>+</sup></button>
         </div>
         <div
-          ref={ref} className="text-editor" contentEditable suppressContentEditableWarning
+          ref={ref} className="text-editor" style={{ fontSize }} contentEditable suppressContentEditableWarning
           data-placeholder="在这里记录内容…支持加粗、列表、标题"
           onInput={handleInput}
+          onPaste={handlePaste}
           onBlur={(e) => {
             if (typingTimer.current) clearTimeout(typingTimer.current);
-            onChange((p) => ({ ...p, content: { html: readHtml(e.currentTarget) } }), { immediate: true });
+            onChange((p) => ({ ...p, content: { ...p.content, html: readHtml(e.currentTarget) } }), { immediate: true });
           }}
         />
       </div>
