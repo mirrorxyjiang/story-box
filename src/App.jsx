@@ -952,9 +952,16 @@ function Shell({ children }) {
         .text-toolbar button.font-size-btn sup { font-size: 9px; margin-left: 1px; }
         .text-toolbar button.font-size-btn:disabled { opacity: 0.35; cursor: default; }
         .text-toolbar button.font-size-label { width: auto; min-width: 44px; padding: 0 6px; font-size: 11.5px; color: var(--ink-soft); }
-        .text-editor { flex: 1; padding: 28px 40px; overflow-y: auto; outline: none; font-size: 14.5px; line-height: calc(1em + 12px); max-width: 780px; }
-        .text-editor h3 { line-height: calc(1em + 12px); }
-        .text-editor p { margin: 0; }
+        .text-editor { --para-gap: calc(0.25em + 2px); flex: 1; padding: 28px 40px; overflow-y: auto; outline: none; font-size: 14.5px; line-height: calc(1em + 12px); max-width: 780px; }
+        /* 排版：行距 = 字号 + 12px；段落之间在行距之外再多 --para-gap（比行距稍大一点，随字号缓慢增长）。
+           用 margin-top 而不是 margin-bottom：浏览器里第一行常是不带标签的裸文本、从第二行起才是 <div>，
+           这样第一段和第二段之间也有间距。 */
+        .text-editor > div, .text-editor > p { margin: var(--para-gap) 0 0; }
+        /* 只含一个 <br> 的空行：只占一行高度，不再额外叠加段间距 */
+        .text-editor > div:has(> br:only-child), .text-editor > p:has(> br:only-child) { margin-top: 0; }
+        .text-editor ul, .text-editor ol { margin: var(--para-gap) 0 0; padding-left: 1.6em; }
+        .text-editor li { margin: 0; }
+        .text-editor h3 { line-height: calc(1em + 12px); margin: calc(var(--para-gap) * 2) 0 0; }
         .text-editor:empty:before { content: attr(data-placeholder); color: #a89f8c; }
         .draw-page { display: flex; flex-direction: column; height: 100%; }
         .draw-toolbar { display: flex; align-items: center; gap: 6px; padding: 8px 16px; border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
